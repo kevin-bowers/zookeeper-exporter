@@ -35,57 +35,65 @@ func getMetrics(zkOpts zkOptions) map[string]string {
 		hostLabel := fmt.Sprintf("zk_host=%q", h.Unresolved)
 
 		// open connection
-		timeout := time.Duration(zkOpts.Timeout) * time.Second
-		d := net.Dialer{Timeout: timeout}
-		conn, err := d.Dial("tcp", h.TCPAddr.String())
-		if err != nil {
-			log.Printf("warning: cannot connect to %s: %v", h.Unresolved, err)
-			metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "0"
-			continue
-		}
+        commands := []string{"ruok", "mntr"}
+        for _, command := range commands {
+		    timeout := time.Duration(zkOpts.Timeout) * time.Second
+		    d := net.Dialer{Timeout: timeout}
+		    conn, err := d.Dial("tcp", h.TCPAddr.String())
+		    if err != nil {
+		    	log.Printf("warning: cannot connect to %s: %v", h.Unresolved, err)
+		    	metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "0"
+		    	continue
+		    }
 
-		defer conn.Close()
+		    defer conn.Close()
+		    _, err = conn.Write([]byte(command))
+		    errFatal(err)
 
-		_, err = conn.Write([]byte("mntr"))
-		errFatal(err)
+		    // read response
+		    res, err := ioutil.ReadAll(conn)
+		    errFatal(err)
 
-		// read response
-		res, err := ioutil.ReadAll(conn)
-		errFatal(err)
+		    // get slice of strings from response, like 'zk_avg_latency 0'
+		    lines := strings.Split(string(res), "\n")
 
-		// get slice of strings from response, like 'zk_avg_latency 0'
-		lines := strings.Split(string(res), "\n")
+		    if command == "ruok" {
+		        if lines[0] == "imok" {
+		            metrics[fmt.Sprintf("zk_ok{%s}", hostLabel)] = "1"
+		        } else {
+		            metrics[fmt.Sprintf("zk_ok{%s}", hostLabel)] = "0"
+		        }
+		    }
+            if command == "mntr" {
+                // skip instance if it in a leader only state and isnt serving client requests
+		        if lines[0] == "This ZooKeeper instance is not currently serving requests" {
+		        	metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "1"
+		        	metrics[fmt.Sprintf("zk_server_leader{%s}", hostLabel)] = "1"
+		        	continue
+		        }
+		        // split each line into key-value pair
+		        for _, l := range lines {
+		        	l = strings.Replace(l, "\t", " ", -1)
+		        	kv := strings.Split(l, " ")
 
-		// skip instance if it in a leader only state and doesnt serving client requets
-		if lines[0] == "This ZooKeeper instance is not currently serving requests" {
-			metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "1"
-			metrics[fmt.Sprintf("zk_server_leader{%s}", hostLabel)] = "1"
-			continue
-		}
-
-		// split each line into key-value pair
-		for _, l := range lines {
-			l = strings.Replace(l, "\t", " ", -1)
-			kv := strings.Split(l, " ")
-
-			if kv[0] == "zk_server_state" {
-				zkLeader := fmt.Sprintf("zk_server_leader{%s}", hostLabel)
-				if kv[1] == "leader" {
-					metrics[zkLeader] = "1"
-				} else {
-					metrics[zkLeader] = "0"
-				}
-			} else if kv[0] == "zk_version" {
-				zkVersion := fmt.Sprintf("zk_version{%s,version=%q}", hostLabel, strings.Join(kv[1:], " "))
-				metrics[zkVersion] = "1"
-			} else if kv[0] != "" {
-				metrics[fmt.Sprintf("%s{%s}", kv[0], hostLabel)] = kv[1]
-			}
-		}
-
-		metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "1"
-	}
-
+		        	if kv[0] == "zk_server_state" {
+		        		zkLeader := fmt.Sprintf("zk_server_leader{%s}", hostLabel)
+		        		if kv[1] == "leader" {
+		        			metrics[zkLeader] = "1"
+		        		} else {
+		        			metrics[zkLeader] = "0"
+		        		}
+		        	} else if kv[0] == "zk_version" {
+		        		zkVersion := fmt.Sprintf("zk_version{%s,version=%q}", hostLabel, strings.Join(kv[1:], " "))
+		        		metrics[zkVersion] = "1"
+		        	} else if kv[0] != "" {
+		        		metrics[fmt.Sprintf("%s{%s}", kv[0], hostLabel)] = kv[1]
+		        	}
+		        }
+		    }
+		    metrics[fmt.Sprintf("zk_up{%s}", hostLabel)] = "1"
+	    }
+    }
 	return metrics
 }
 
@@ -96,7 +104,6 @@ func serveMetrics(location, listen string, zkOpts zkOptions) {
 			fmt.Fprintf(w, "%s %s\n", k, v)
 		}
 	}
-
 	http.HandleFunc(location, h)
 	log.Printf("starting serving metrics at %s%s", listen, location)
 	err := http.ListenAndServe(listen, nil)
